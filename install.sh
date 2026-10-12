@@ -2267,7 +2267,7 @@ def prompt(msg, default=None, required=False):
             return default
         if not required:
             return ""
-        print("  این مقدار الزامی است، دوباره وارد کنید.")
+        print("  This value is required, please enter it.")
 
 
 def prompt_int(msg, default=None, required=False):
@@ -2278,7 +2278,7 @@ def prompt_int(msg, default=None, required=False):
         try:
             return int(v)
         except ValueError:
-            print("  لطفاً یک عدد صحیح وارد کنید.")
+            print("  Please enter a whole number.")
 
 
 def prompt_yesno(msg, default=True):
@@ -2289,7 +2289,7 @@ def prompt_yesno(msg, default=True):
         val = ""
     if not val:
         return default
-    return val[0] in ("y", "ب")  # ب for "بله"
+    return val[0] == "y"
 
 
 def prompt_menu(title, options):
@@ -2299,12 +2299,12 @@ def prompt_menu(title, options):
     valid = {k for k, _ in options}
     while True:
         try:
-            choice = input("انتخاب شما: ").strip()
+            choice = input("Your choice: ").strip()
         except EOFError:
             return "0"
         if choice in valid:
             return choice
-        print("  گزینه نامعتبر است، دوباره امتحان کنید.")
+        print("  Invalid option, please try again.")
 
 
 def detect_public_ip():
@@ -2320,10 +2320,10 @@ def detect_public_ip():
 
 
 def prompt_role():
-    c = prompt_menu("نقش این سرور را انتخاب کنید:", [
-        ("1", "Install Server  (این ماشین سرور ایران است — inner پیش‌فرض 10.10.10.2)"),
-        ("2", "Install Client  (این ماشین سرور خارج/Kharej است — inner پیش‌فرض 10.10.10.1)"),
-        ("0", "بازگشت به منوی اصلی"),
+    c = prompt_menu("Select the role of this server:", [
+        ("1", "Install Server  (this machine is the Iran server — default inner 10.10.10.2)"),
+        ("2", "Install Client  (this machine is the foreign/Kharej server — default inner 10.10.10.1)"),
+        ("0", "Back to main menu"),
     ])
     if c == "0":
         return None
@@ -2331,29 +2331,29 @@ def prompt_role():
 
 
 def prompt_common(is_server, default_name):
-    name = prompt("نام این تانل", default=default_name)
-    local = prompt("آدرس بیرونی (Outer/Public) همین سرور", default=detect_public_ip(), required=True)
-    remote = prompt("آدرس بیرونی (Outer/Public) سرور مقابل", required=True)
-    inner_local = prompt("آدرس داخلی (Inner) همین سرور",
+    name = prompt("Name of this tunnel", default=default_name)
+    local = prompt("Outer/Public address of this server", default=detect_public_ip(), required=True)
+    remote = prompt("Outer/Public address of the peer server", required=True)
+    inner_local = prompt("Inner address of this server",
                           default="10.10.10.2/30" if is_server else "10.10.10.1/30")
-    inner_peer_full = prompt("آدرس داخلی (Inner) سرور مقابل",
+    inner_peer_full = prompt("Inner address of the peer server",
                               default="10.10.10.1" if is_server else "10.10.10.2")
     inner_peer_ip = inner_peer_full.split("/")[0]
     return name, local, remote, inner_local, inner_peer_ip
 
 
 def do_port_forward_flow(inner_peer_ip, family=4):
-    print("\n--- فوروارد پورت از طریق این تانل ---")
-    ports_raw = prompt("پورت‌هایی که باید از طریق این تانل عبور کنند را با کاما وارد کنید "
-                        "(مثل 443,8080,2053) — برای رد شدن خالی بگذارید", default="")
+    print("\n--- Port forwarding through this tunnel ---")
+    ports_raw = prompt("Enter the ports that should go through this tunnel, comma-separated "
+                        "(e.g. 443,8080,2053) — leave blank to skip", default="")
     if not ports_raw.strip():
-        print("هیچ فورواردی اضافه نشد.")
+        print("No forwarding rule was added.")
         return
-    proto_choice = prompt("کدام پروتکل فوروارد شود؟ (tcp/udp/both)", default="both").lower()
+    proto_choice = prompt("Which protocol should be forwarded? (tcp/udp/both)", default="both").lower()
     protos = ["tcp", "udp"] if proto_choice not in ("tcp", "udp") else [proto_choice]
     for p in [x.strip() for x in ports_raw.split(",") if x.strip()]:
         if not p.isdigit():
-            print(f"  رد شد (عدد نیست): {p}")
+            print(f"  skipped (not a number): {p}")
             continue
         for proto in protos:
             rule_name = f"fwd-{inner_peer_ip.replace('.', '-')}-{p}-{proto}"
@@ -2362,7 +2362,7 @@ def do_port_forward_flow(inner_peer_ip, family=4):
                                      iface=None, masquerade=True, family=family)
             cmd_net_forward_add(a_add)
             cmd_net_forward_apply(SimpleNamespace(name=rule_name))
-    print(f"\nترافیک پورت‌(های) {ports_raw} اکنون از طریق این تانل به سمت {inner_peer_ip} فوروارد می‌شود.")
+    print(f"\nTraffic for port(s) {ports_raw} is now forwarded through this tunnel to {inner_peer_ip}.")
 
 
 def print_peer_instructions(local, remote, inner_local, inner_peer_ip):
@@ -2376,19 +2376,19 @@ def print_peer_instructions(local, remote, inner_local, inner_peer_ip):
     mask = inner_local.split("/")[1] if inner_local and "/" in inner_local else "30"
     own_inner_ip = inner_local.split("/")[0] if inner_local else "?"
     print("\n" + "=" * 62)
-    print("این مقادیر را روی سرور مقابل (نقش مقابل) وارد کنید:")
-    print(f"  آدرس بیرونی (Local/Outer) خودِ آن سرور      : {remote}")
-    print(f"  آدرس بیرونی (Remote/Outer) این سرور          : {local}")
-    print(f"  آدرس داخلی (Local/Inner) خودِ آن سرور        : {inner_peer_ip}/{mask}")
-    print(f"  آدرس داخلی (Peer/Inner) این سرور             : {own_inner_ip}")
+    print("Enter these values on the peer server (opposite role):")
+    print(f"  Outer (Local/Outer) address of that server    : {remote}")
+    print(f"  Outer (Remote/Outer) address of this server   : {local}")
+    print(f"  Inner (Local/Inner) address of that server     : {inner_peer_ip}/{mask}")
+    print(f"  Inner (Peer/Inner) address of this server       : {own_inner_ip}")
     print("=" * 62)
 
 
 def after_create(name, inner_peer_ip, iface, is_server, family=4,
                   local=None, remote=None, inner_local=None):
-    print(f"\nتانل '{name}' ساخته شد.")
+    print(f"\nTunnel '{name}' created.")
     print_peer_instructions(local, remote, inner_local, inner_peer_ip)
-    print(f"\nبررسی اتصال به {inner_peer_ip} ...")
+    print(f"\nChecking connectivity to {inner_peer_ip} ...")
     time.sleep(1)
     cmd = ["ping", "-c", "2", "-W", "2"]
     if iface:
@@ -2396,10 +2396,10 @@ def after_create(name, inner_peer_ip, iface, is_server, family=4,
     cmd.append(inner_peer_ip)
     r = run(cmd, check=False, capture=True)
     if r.returncode == 0:
-        print("  \u2705 پینگ موفق بود — تانل برقرار است.")
+        print("  \u2705 Ping succeeded — the tunnel is up.")
     else:
-        print("  \u26a0 پینگ ناموفق بود. مطمئن شوید سرور مقابل هم همین تانل را با تنظیمات درست نصب کرده "
-              "(IDها/کلیدها/VNI/پورت باید دقیقاً مطابق هم باشند).")
+        print("  \u26a0 Ping failed. Make sure the peer server has installed the same tunnel with matching "
+              "settings (IDs/keys/VNI/port must match exactly).")
     if is_server:
         do_port_forward_flow(inner_peer_ip, family=family)
 
@@ -2410,7 +2410,7 @@ def menu_gre():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "gre0")
-    key = prompt("GRE key (مشترک و یکسان در هر دو سرور، اختیاری)", default="")
+    key = prompt("GRE key (shared and identical on both servers, optional)", default="")
     ttl = prompt_int("TTL", default=64)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, key=key or None, ttl=ttl, tos=None)
@@ -2422,11 +2422,11 @@ def menu_gretap():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "gretap0")
-    key = prompt("GRE key (مشترک و یکسان در هر دو سرور، اختیاری)", default="")
+    key = prompt("GRE key (shared and identical on both servers, optional)", default="")
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, key=key or None)
     tunnel_create_gretap(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_ipip():
@@ -2437,7 +2437,7 @@ def menu_ipip():
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, ttl=ttl, tos=None)
     tunnel_create_ipip(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_sit():
@@ -2448,60 +2448,60 @@ def menu_sit():
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, ttl=ttl)
     tunnel_create_sit(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_vxlan():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "vxlan0")
-    vni = prompt_int("VNI (باید در هر دو سرور یکسان باشد)", default=42)
-    port = prompt_int("پورت VXLAN", default=4789)
+    vni = prompt_int("VNI (must be the same on both servers)", default=42)
+    port = prompt_int("VXLAN port", default=4789)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, vni=vni, port=port, dev=None)
     tunnel_create_vxlan(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_geneve():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "gnv0")
-    vni = prompt_int("VNI (باید در هر دو سرور یکسان باشد)", default=42)
-    port = prompt_int("پورت GENEVE", default=6081)
+    vni = prompt_int("VNI (must be the same on both servers)", default=42)
+    port = prompt_int("GENEVE port", default=6081)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, vni=vni, port=port)
     tunnel_create_geneve(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_gue():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "gue0")
-    port = prompt_int("پورت GUE (پروفایل Gaming)", default=5555)
+    port = prompt_int("GUE port (Gaming profile)", default=5555)
     ttl = prompt_int("TTL", default=64)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, port=port, ttl=ttl, tos=0)
     tunnel_create_gue(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_wireguard():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "wg0")
-    port = prompt_int("پورت WireGuard", default=51820)
+    port = prompt_int("WireGuard port", default=51820)
     ensure_home()
     priv_path = HOME_DIR / f"{name}-private.key"
     pub_path = HOME_DIR / f"{name}-public.key"
     if not priv_path.exists():
         run(["bash", "-c", f"umask 077 && wg genkey | tee {shlex.quote(str(priv_path))} "
                             f"| wg pubkey > {shlex.quote(str(pub_path))}"])
-    local_pub = pub_path.read_text().strip() if pub_path.exists() else "(dry-run: نامشخص)"
-    print(f"\nکلید عمومی (Public Key) همین سرور — این را روی سرور مقابل وارد کنید:\n  {local_pub}\n")
-    peer_pub = prompt("کلید عمومی (Public Key) سرور مقابل را اینجا بچسبانید", required=True)
-    psk = prompt("کلید مشترک PSK (اختیاری، باید در هر دو سرور یکسان باشد)", default="")
+    local_pub = pub_path.read_text().strip() if pub_path.exists() else "(dry-run: unknown)"
+    print(f"\nPublic key of this server — enter this on the peer server:\n  {local_pub}\n")
+    peer_pub = prompt("Paste the peer server's public key here", required=True)
+    psk = prompt("Shared PSK (optional, must be the same on both servers)", default="")
     psk_path = None
     if psk:
         psk_path = HOME_DIR / f"{name}-psk.key"
@@ -2511,27 +2511,27 @@ def menu_wireguard():
                          peer_pubkey=peer_pub, psk_file=str(psk_path) if psk_path else None,
                          listen_port=port, remote_port=port, allowed_ips=None)
     tunnel_create_wireguard(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_l2tpv3():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "l2tp0")
-    encap = prompt("نوع حمل (udp/ip)", default="udp")
-    conn_id = prompt_int("شماره شناسه اتصال (همین عدد را عیناً روی سرور مقابل هم وارد کنید)", default=100)
+    encap = prompt("Encapsulation type (udp/ip)", default="udp")
+    conn_id = prompt_int("Connection ID number (enter this exact number on the peer server too)", default=100)
     if is_server:
         tunnel_id, peer_tunnel_id, session_id, peer_session_id = conn_id, conn_id + 1, conn_id, conn_id + 1
     else:
         tunnel_id, peer_tunnel_id, session_id, peer_session_id = conn_id + 1, conn_id, conn_id + 1, conn_id
-    local_port = prompt_int("پورت محلی UDP", default=1701) if encap == "udp" else 1701
-    remote_port = prompt_int("پورت مقابل UDP", default=1701) if encap == "udp" else 1701
+    local_port = prompt_int("Local UDP port", default=1701) if encap == "udp" else 1701
+    remote_port = prompt_int("Peer UDP port", default=1701) if encap == "udp" else 1701
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, encap=encap, tunnel_id=tunnel_id,
                          peer_tunnel_id=peer_tunnel_id, session_id=session_id,
                          peer_session_id=peer_session_id, local_port=local_port, remote_port=remote_port)
     tunnel_create_l2tpv3(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_esp():
@@ -2539,13 +2539,13 @@ def menu_esp():
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "esp0")
     if is_server:
-        print("\nکلیدها به‌صورت خودکار تولید می‌شوند و در پایان برای کپی به سرور مقابل نمایش داده می‌شوند.")
+        print("\nKeys will be generated automatically and shown at the end to copy to the peer server.")
         a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                              inner_peer=inner_peer_ip, local_net=None, remote_net=None,
                              spi_out=None, spi_in=None, enc_key=None, auth_key=None)
     else:
-        print("\nمقادیری که سرور ایران نمایش داد را اینجا وارد کنید "
-              "(SPIها از قبل جابه‌جا شده‌اند، همان‌طور که سرور نمایش داد).")
+        print("\nEnter the values shown by the Iran server here "
+              "(the SPIs are already swapped, as shown by the server).")
         enc_key = prompt("enc_key", required=True)
         auth_key = prompt("auth_key", required=True)
         spi_out = prompt_int("spi_out", required=True)
@@ -2554,122 +2554,125 @@ def menu_esp():
                              inner_peer=inner_peer_ip, local_net=None, remote_net=None,
                              spi_out=spi_out, spi_in=spi_in, enc_key=enc_key, auth_key=auth_key)
     tunnel_create_esp(a)
-    after_create(name, inner_peer_ip, None, is_server)
+    after_create(name, inner_peer_ip, None, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_tun_udp():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "tun-udp0")
-    local_port = prompt_int("پورت محلی (بازه پیشنهادی 56000-56899)", default=56000)
-    remote_port = prompt_int("پورت مقابل (بازه پیشنهادی 55000-55899)", default=55000)
+    local_port = prompt_int("Local port (suggested range 56000-56899)", default=56000)
+    remote_port = prompt_int("Peer port (suggested range 55000-55899)", default=55000)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, local_port=local_port, remote_port=remote_port)
     tunnel_create_tun_udp(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_tun_tcp():
     is_server = prompt_role()
     if is_server is None: return
     name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "tun-tcp0")
-    listen = prompt_yesno("این سرور Listen کند (منتظر اتصال از سمت مقابل بماند)؟", default=is_server)
-    port = prompt_int("پورت TCP (بازه پیشنهادی 55000-55899)", default=55000)
+    listen = prompt_yesno("Should this server listen (wait for a connection from the peer)?", default=is_server)
+    port = prompt_int("TCP port (suggested range 55000-55899)", default=55000)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip,
                          local_port=port if listen else None,
                          remote_port=None if listen else port,
                          listen=listen)
     tunnel_create_tun_tcp(a)
-    after_create(name, inner_peer_ip, name, is_server)
+    after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
 
 def menu_tun_icmp():
     is_server = prompt_role()
     if is_server is None: return
-    name = prompt("نام این تانل", default="tun-icmp0")
-    local = prompt("آدرس بیرونی همین سرور", default=detect_public_ip()) if is_server else None
-    remote = prompt("آدرس بیرونی سرور مقابل", required=True) if not is_server else None
-    local_bridge_port = prompt_int("پورت پل محلی (Local bridge port)", default=2222)
-    remote_bridge_port = prompt_int("پورت SSH مقصد (برای حالت کلاینت)", default=22) if not is_server else 22
+    name = prompt("Name of this tunnel", default="tun-icmp0")
+    local = prompt("Outer address of this server", default=detect_public_ip()) if is_server else None
+    remote = prompt("Outer address of the peer server", required=True) if not is_server else None
+    local_bridge_port = prompt_int("Local bridge port", default=2222)
+    remote_bridge_port = prompt_int("Destination SSH port (for client mode)", default=22) if not is_server else 22
     a = SimpleNamespace(name=name, local=local, remote=remote, server_mode=is_server,
                          local_bridge_port=local_bridge_port, remote_bridge_port=remote_bridge_port)
     tunnel_create_tun_icmp(a)
-    print("توجه: این حالت رابط tun معمولی نمی‌سازد (رله روی TCP از طریق ICMP است)؛ "
-          "برای فوروارد پورت بعداً از منوی شماره 18 (قوانین شبکه) استفاده کنید.")
-    input("Enter برای بازگشت...")
+    print("Note: this mode does not create a normal tun interface (it relays TCP over ICMP); "
+          "use menu item 18 (network rules) afterward for port forwarding.")
+    input("Press Enter to return...")
 
 
 def menu_ssh():
     is_server = prompt_role()
     if is_server is None: return
-    name = prompt("نام این تانل", default="ssh-tun0")
+    name = prompt("Name of this tunnel", default="ssh-tun0")
     if is_server:
-        print("این سرور (ایران) نقش SSH TUN initiator را دارد و به سمت سرور خارج وصل می‌شود.")
-        remote = prompt("آدرس سرور خارج (که باید Reverse SSH روی آن فعال باشد)", required=True)
-        user = prompt("نام کاربری SSH سرور خارج", default="root")
-        port = prompt_int("پورت SSH", default=22)
-        identity = prompt("مسیر فایل کلید خصوصی SSH (خالی = استفاده از رمز عبور)", default="")
-        password = prompt("رمز عبور SSH (اگر از کلید استفاده نمی‌کنید)", default="") if not identity else None
-        local_tun_num = prompt_int("شماره tun محلی", default=10)
-        peer_tun_num = prompt_int("شماره tun مقابل", default=10)
-        inner_local = prompt("آدرس داخلی این سرور", default="10.10.10.2/30")
-        inner_peer = prompt("آدرس داخلی سرور مقابل", default="10.10.10.1")
+        print("This server (Iran) acts as the SSH TUN initiator and connects to the foreign server.")
+        local = prompt("Outer address of this server (only for the peer-side instructions)",
+                        default=detect_public_ip())
+        remote = prompt("Address of the foreign server (which must have Reverse SSH enabled)", required=True)
+        user = prompt("SSH username on the foreign server", default="root")
+        port = prompt_int("SSH port", default=22)
+        identity = prompt("Path to the SSH private key file (leave empty to use a password)", default="")
+        password = prompt("SSH password (if not using a key)", default="") if not identity else None
+        local_tun_num = prompt_int("Local tun number", default=10)
+        peer_tun_num = prompt_int("Peer tun number", default=10)
+        inner_local = prompt("Inner address of this server", default="10.10.10.2/30")
+        inner_peer = prompt("Inner address of the peer server", default="10.10.10.1")
         a = SimpleNamespace(name=name, remote=remote, user=user, port=port,
                              identity=identity or None, password=password or None,
                              local_tun_num=local_tun_num, peer_tun_num=peer_tun_num,
                              inner_local=inner_local, inner_peer=inner_peer)
         tunnel_create_ssh(a)
-        after_create(name, inner_peer.split("/")[0], f"tun{local_tun_num}", True)
+        after_create(name, inner_peer.split("/")[0], f"tun{local_tun_num}", True,
+                     local=local, remote=remote, inner_local=inner_local)
     else:
-        print("این سرور (خارج) نقش Reverse SSH (گیرنده) را دارد — طرف مقابل باید SSH TUN را وصل کند.")
-        apply = prompt_yesno("sshd_config به‌صورت خودکار ویرایش شود "
-                              "('PermitTunnel yes' + ری‌استارت سرویس ssh)؟", default=True)
+        print("This server (foreign) acts as Reverse SSH (receiver) — the peer must connect the SSH TUN.")
+        apply = prompt_yesno("Automatically edit sshd_config "
+                              "('PermitTunnel yes' + restart the ssh service)?", default=True)
         a = SimpleNamespace(name=name, apply=apply, sshd_config="/etc/ssh/sshd_config")
         tunnel_create_reverse_ssh(a)
-        input("\nEnter برای بازگشت...")
+        input("\nPress Enter to return...")
 
 
 def menu_etherip():
-    print("\nساخت مدیریت‌شده‌ی EtherIP روی لینوکس استاندارد ممکن نیست "
-          "(همین محدودیت در خود پروژه‌ی اصلی iMonitor هم هست).")
-    print("فقط می‌توانید یک اینترفیس EtherIP که جای دیگری ساخته شده را مانیتور کنید:")
+    print("\nManaged EtherIP creation is not possible on standard Linux "
+          "(the original iMonitor project has the same limitation).")
+    print("You can only monitor an EtherIP interface that was created elsewhere:")
     print("  python3 imonitor_cli.py monitor add --name X --type tunnel --tunnel-iface IFACE")
-    input("\nEnter برای بازگشت...")
+    input("\nPress Enter to return...")
 
 
 def menu_list_tunnels():
     cmd_tunnel_list(SimpleNamespace())
-    input("\nEnter برای بازگشت...")
+    input("\nPress Enter to return...")
 
 
 def menu_list_net_rules():
     cmd_net_list(SimpleNamespace())
-    input("\nEnter برای بازگشت...")
+    input("\nPress Enter to return...")
 
 
 def menu_remove_all():
-    print("\n\u26a0  این گزینه همه‌ی تانل‌ها، قوانین شبکه‌ای (SNAT/Forward/Shaping/TCP-limit/Watch) و")
-    print("    پروکسی‌های مدیریت‌شده توسط این اسکریپت را به‌طور کامل حذف می‌کند.")
-    if not prompt_yesno("ادامه می‌دهید؟", default=False):
-        print("لغو شد.")
+    print("\n\u26a0  This option will completely remove all tunnels, network rules")
+    print("    (SNAT/Forward/Shaping/TCP-limit/Watch) and proxy entries managed by this script.")
+    if not prompt_yesno("Continue?", default=False):
+        print("Cancelled.")
         return
     conn = db()
 
     for row in conn.execute("SELECT * FROM tunnels").fetchall():
         try:
             _teardown_tunnel(row)
-            print(f"  \u2714 تانل حذف شد: {row['name']}")
+            print(f"  \u2714 tunnel removed: {row['name']}")
         except Exception as e:
-            eprint(f"  \u26a0 حذف تانل '{row['name']}' با خطا مواجه شد: {e}")
+            eprint(f"  \u26a0 failed to remove tunnel '{row['name']}': {e}")
     conn.execute("DELETE FROM tunnels")
 
     for row in conn.execute("SELECT * FROM net_rules WHERE applied=1").fetchall():
         try:
             _teardown_net_rule(row)
-            print(f"  \u2714 قانون شبکه حذف شد: {row['name']} ({row['kind']})")
+            print(f"  \u2714 network rule removed: {row['name']} ({row['kind']})")
         except Exception as e:
-            eprint(f"  \u26a0 حذف قانون '{row['name']}' با خطا مواجه شد: {e}")
+            eprint(f"  \u26a0 failed to remove rule '{row['name']}': {e}")
     conn.execute("DELETE FROM net_rules")
 
     for row in conn.execute("SELECT * FROM proxies").fetchall():
@@ -2678,12 +2681,12 @@ def menu_remove_all():
             pid = pidfile.read_text().strip()
             run(["kill", pid], check=False)
             pidfile.unlink(missing_ok=True)
-            print(f"  \u2714 پروکسی متوقف شد: {row['name']}")
+            print(f"  \u2714 proxy stopped: {row['name']}")
     conn.execute("DELETE FROM proxies")
 
     conn.commit()
-    print("\n\u2705 همه چیز پاک شد.")
-    input("Enter برای بازگشت...")
+    print("\n\u2705 Everything has been removed.")
+    input("Press Enter to return...")
 
 
 MENU_ACTIONS = {
@@ -2697,29 +2700,29 @@ MENU_ACTIONS = {
 
 def main_menu():
     while True:
-        choice = prompt_menu("=== iMonitor CLI \u2014 مدیریت تانل (بدون پنل وب، فقط اسکریپت) ===", [
+        choice = prompt_menu("=== iMonitor CLI \u2014 Tunnel Management (no web panel, script only) ===", [
             ("1", "GRE"),
             ("2", "GRETAP"),
             ("3", "IPIP"),
             ("4", "SIT  (IPv6-in-IPv4)"),
             ("5", "VXLAN"),
             ("6", "GENEVE"),
-            ("7", "GUE  (پروفایل Gaming)"),
-            ("8", "WireGuard  (پروفایل Secure)"),
+            ("7", "GUE  (Gaming profile)"),
+            ("8", "WireGuard  (Secure profile)"),
             ("9", "L2TPv3"),
-            ("10", "ESP / XFRM (دستی)"),
+            ("10", "ESP / XFRM (manual)"),
             ("11", "TUN/UDP"),
             ("12", "TUN/TCP"),
             ("13", "TUN/ICMP"),
-            ("14", "SSH Tunnel  (+ Reverse SSH برای سمت خارج)"),
-            ("15", "EtherIP  (فقط مانیتورینگ)"),
-            ("16", "نمایش لیست تانل‌های فعال"),
-            ("17", "نمایش قوانین شبکه (SNAT/Forward/Shape/...)"),
-            ("18", "\u2716  حذف همه‌ی تغییرات اعمال‌شده (Remove ALL)"),
-            ("0", "خروج"),
+            ("14", "SSH Tunnel  (+ Reverse SSH for the foreign side)"),
+            ("15", "EtherIP  (monitoring only)"),
+            ("16", "Show list of active tunnels"),
+            ("17", "Show network rules (SNAT/Forward/Shape/...)"),
+            ("18", "\u2716  Remove ALL applied changes (Remove ALL)"),
+            ("0", "Exit"),
         ])
         if choice == "0":
-            print("خداحافظ.")
+            print("Goodbye.")
             return
         fn = MENU_ACTIONS.get(choice)
         if not fn:
@@ -2727,11 +2730,11 @@ def main_menu():
         try:
             fn()
         except SystemExit:
-            print("  \u26a0 عملیات با خطا متوقف شد (پیام بالا را ببینید). به منو برمی‌گردیم.")
+            print("  \u26a0 Operation stopped due to an error (see message above). Returning to menu.")
         except KeyboardInterrupt:
-            print("\n  لغو شد.")
+            print("\n  Cancelled.")
         except Exception as e:
-            eprint(f"  خطای غیرمنتظره: {e}")
+            eprint(f"  Unexpected error: {e}")
 
 
 def main():
@@ -2742,7 +2745,7 @@ def main():
         try:
             main_menu()
         except KeyboardInterrupt:
-            print("\nخداحافظ.")
+            print("\nGoodbye.")
         return
     parser = build_parser()
     args = parser.parse_args()
