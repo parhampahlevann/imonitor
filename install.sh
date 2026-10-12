@@ -26,6 +26,11 @@ helper binaries, CLI/script only, by design. Deliberately out of scope:
     TCP-listener reachability check: needs Xray installed separately,
     same as the original project's own documented "Direct mode"
     limitation (not a gap vs. the real app -- it has the same limit).
+    This script NEVER installs xray or anything xray-related — it only
+    writes an Xray-compatible JSON config file and drives an already
+    present `xray` binary. If you already run your own panel/stack that
+    pushes traffic through xray, you can ignore the `proxy` subcommand
+    entirely; nothing here touches it.
   - the hosted "Radar" central probe network (needs iMonitor's own
     central infrastructure; no local script can reproduce it).
   - EtherIP managed creation (the original project also rejects this on
@@ -42,7 +47,8 @@ binaries required.
 Runtime dependencies (install what you actually use):
   ping, curl, ip, tc, iptables/ip6tables, wg (wireguard-tools), socat,
   ssh/sshpass, tar/gzip/xz/zip, aws-cli (for S3 backups), dig (optional,
-  improves DNS record-type checks)
+  improves DNS record-type checks), haproxy (optional, only if you choose
+  the haproxy forwarding method instead of iptables)
 
 Usage:
   python3 imonitor_cli.py                 # no args -> interactive menu (role-based:
@@ -57,12 +63,16 @@ Usage:
 
 The interactive menu covers every tunnel mode (role = Install Server --> this
 is the Iran box, inner 10.10.10.2 by default; Install Client --> this is the
-Kharej/foreign box, inner 10.10.10.1 by default), verifies the peer inner-IP
-ping after bringing each tunnel up, then on the Server role asks for a
-comma-separated port list and wires up forwarding for each through the
-tunnel automatically. A final "Remove ALL" menu entry tears down every
-tunnel and net rule this script has applied. All of this is also reachable
-without the menu via plain CLI flags (see --help), for scripting/cron use.
+Kharej/foreign box, inner 10.10.10.1 by default), auto-detects this box's own
+outer IPv4/IPv6 address (so only the PEER's address is ever asked), applies a
+shared dedicated MTU to every tunnel interface, verifies the peer inner-IP
+ping after bringing each tunnel up, then ALWAYS asks (on either role; leave
+blank to skip) for a comma-separated port list and wires up forwarding for
+each through the tunnel automatically, via iptables or haproxy. A final
+"Remove ALL" menu entry tears down every tunnel and net rule this script has
+applied, and a "Status" entry shows live state for every tunnel.
+All of this is also reachable without the menu via plain CLI flags (see
+--help), for scripting/cron use.
 """
 from types import SimpleNamespace
 
@@ -96,6 +106,13 @@ from pathlib import Path
 HOME_DIR = Path(os.environ.get("IMONITOR_HOME", str(Path.home() / ".imonitor")))
 DB_PATH = HOME_DIR / "imonitor.db"
 DRY_RUN = False
+
+# --------------------------------------------------------------------------
+# Shared Iran <-> Kharej tunnel defaults
+# --------------------------------------------------------------------------
+DEFAULT_TUNNEL_PORT = 2058   # shared port default for every protocol that needs one
+DEFAULT_PSK = "123"          # default WireGuard preshared key (override for real deployments)
+DEFAULT_MTU = 1367           # dedicated MTU applied to every tunnel interface
 
 
 def ensure_home():
@@ -759,9 +776,11 @@ def _tunnel_save(name, mode, iface, config):
         die(f"a tunnel named '{name}' already exists (use `tunnel delete` first)")
 
 
-def _addr_up(iface, addr):
+def _addr_up(iface, addr, mtu=None):
     if addr:
         run(["ip", "addr", "add", addr, "dev", iface], check=False)
+    if mtu:
+        run(["ip", "link", "set", iface, "mtu", str(mtu)], check=False)
     run(["ip", "link", "set", iface, "up"])
 
 
@@ -772,7 +791,7 @@ def tunnel_create_gre(a):
     if a.tos: cmd += ["tos", str(a.tos)]
     if a.key: cmd += ["key", str(a.key)]
     run(cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "gre", a.name, clean_vars(a))
 
 
@@ -781,7 +800,7 @@ def tunnel_create_gretap(a):
            "local", a.local, "remote", a.remote]
     if a.key: cmd += ["key", str(a.key)]
     run(cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "gretap", a.name, clean_vars(a))
 
 
@@ -791,7 +810,7 @@ def tunnel_create_ipip(a):
     if a.ttl: cmd += ["ttl", str(a.ttl)]
     if a.tos: cmd += ["tos", str(a.tos)]
     run(cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "ipip", a.name, clean_vars(a))
 
 
@@ -800,16 +819,16 @@ def tunnel_create_sit(a):
            "local", a.local, "remote", a.remote]
     if a.ttl: cmd += ["ttl", str(a.ttl)]
     run(cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "sit", a.name, clean_vars(a))
 
 
 def tunnel_create_vxlan(a):
     cmd = ["ip", "link", "add", a.name, "type", "vxlan", "id", str(a.vni or 42),
-           "remote", a.remote, "local", a.local, "dstport", str(a.port or 4789)]
+           "remote", a.remote, "local", a.local, "dstport", str(a.port or DEFAULT_TUNNEL_PORT)]
     if a.dev: cmd += ["dev", a.dev]
     run(cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "vxlan", a.name, clean_vars(a))
 
 
@@ -818,13 +837,13 @@ def tunnel_create_geneve(a):
            "remote", a.remote]
     if a.port: cmd += ["dstport", str(a.port)]
     run(cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "geneve", a.name, clean_vars(a))
 
 
 def tunnel_create_gue(a):
     """IPIP-over-GUE, matching the 'Gaming' profile: kernel UDP encapsulation."""
-    port = a.port or 5555
+    port = a.port or DEFAULT_TUNNEL_PORT
     run(["ip", "fou", "add", "port", str(port), "gue"], check=False)
     cmd = ["ip", "link", "add", a.name, "type", "ipip",
            "local", a.local, "remote", a.remote,
@@ -832,7 +851,7 @@ def tunnel_create_gue(a):
     if a.ttl: cmd += ["ttl", str(a.ttl)]
     if a.tos: cmd += ["tos", str(a.tos)]
     run(cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "gue", a.name, clean_vars(a))
 
 
@@ -852,7 +871,7 @@ def tunnel_create_wireguard(a):
     if a.psk_file:
         peer_cmd += ["preshared-key", a.psk_file]
     run(peer_cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "wireguard", a.name, clean_vars(a))
 
 
@@ -868,7 +887,7 @@ def tunnel_create_l2tpv3(a):
                 "session_id", str(a.session_id), "peer_session_id", str(a.peer_session_id),
                 "name", a.name]
     run(sess_cmd)
-    _addr_up(a.name, a.inner_local)
+    _addr_up(a.name, a.inner_local, getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "l2tpv3", a.name, clean_vars(a))
 
 
@@ -917,6 +936,8 @@ def tunnel_create_tun_udp(a):
     cmd = (f"socat -d -d TUN:{a.inner_local},iff-up,tun-name={a.name} "
            f"UDP:{a.remote}:{a.remote_port},bind=:{local_port} &")
     run(cmd, shell=True)
+    time.sleep(1)
+    run(["ip", "link", "set", a.name, "mtu", str(getattr(a, "mtu", None) or DEFAULT_MTU)], check=False)
     _tunnel_save(a.name, "tun-udp", a.name, clean_vars(a))
     print(f"started socat TUN/UDP bridge for {a.name} in background")
 
@@ -931,6 +952,8 @@ def tunnel_create_tun_tcp(a):
         cmd = (f"socat -d -d TUN:{a.inner_local},iff-up,tun-name={a.name} "
                f"TCP:{a.remote}:{a.remote_port} &")
     run(cmd, shell=True)
+    time.sleep(1)
+    run(["ip", "link", "set", a.name, "mtu", str(getattr(a, "mtu", None) or DEFAULT_MTU)], check=False)
     _tunnel_save(a.name, "tun-tcp", a.name, clean_vars(a))
     print(f"started socat TUN/TCP bridge for {a.name} in background")
 
@@ -978,7 +1001,8 @@ def tunnel_create_ssh(a):
     run(ssh_cmd)
     iface = f"tun{tun_num}"
     time.sleep(1)
-    _addr_up(iface, a.inner_local if not a.inner_peer else f"{a.inner_local} peer {a.inner_peer}")
+    _addr_up(iface, a.inner_local if not a.inner_peer else f"{a.inner_local} peer {a.inner_peer}",
+             getattr(a, "mtu", None) or DEFAULT_MTU)
     _tunnel_save(a.name, "ssh", iface, clean_vars(a))
 
 
@@ -1065,6 +1089,69 @@ def cmd_tunnel_list(args):
             p = Path(f"/sys/class/net/{r['iface']}/operstate")
             state = p.read_text().strip() if p.exists() else "missing"
         print(f"{r['name']:<20} {r['mode']:<12} iface={r['iface'] or '-':<10} state={state}")
+
+
+def _tunnel_status_one(row):
+    """Collect a richer live-status snapshot for one tracked tunnel row:
+    interface state, peer inner-IP ping, and RX/TX byte counters."""
+    cfg = json.loads(row["config_json"])
+    iface = row["iface"]
+    state = "n/a (no interface)"
+    rx_bytes = tx_bytes = None
+    if iface:
+        p = Path(f"/sys/class/net/{iface}/operstate")
+        state = p.read_text().strip() if p.exists() else "missing"
+        rxp = Path(f"/sys/class/net/{iface}/statistics/rx_bytes")
+        txp = Path(f"/sys/class/net/{iface}/statistics/tx_bytes")
+        if rxp.exists() and txp.exists():
+            try:
+                rx_bytes = int(rxp.read_text())
+                tx_bytes = int(txp.read_text())
+            except ValueError:
+                pass
+    peer_ip = cfg.get("inner_peer")
+    ping_ok = None
+    if peer_ip and iface and state not in ("missing", "n/a (no interface)"):
+        cmd = ["ping", "-c", "1", "-W", "2"]
+        if iface:
+            cmd += ["-I", iface]
+        cmd.append(peer_ip)
+        r = run(cmd, check=False, capture=True)
+        ping_ok = (r.returncode == 0)
+    return {
+        "name": row["name"],
+        "mode": row["mode"],
+        "iface": iface,
+        "state": state,
+        "peer_ip": peer_ip,
+        "ping_ok": ping_ok,
+        "rx_bytes": rx_bytes,
+        "tx_bytes": tx_bytes,
+    }
+
+
+def cmd_tunnel_status(args):
+    """`tunnel status` — live state of every tracked tunnel: interface state,
+    peer inner-IP reachability, and traffic counters (used by the interactive
+    menu's Status option)."""
+    conn = db()
+    rows = conn.execute("SELECT * FROM tunnels ORDER BY name").fetchall()
+    if not rows:
+        print("no tunnels tracked")
+        return
+    for row in rows:
+        s = _tunnel_status_one(row)
+        if s["ping_ok"] is None:
+            ping_s = "n/a"
+        else:
+            ping_s = "reachable" if s["ping_ok"] else "NO REPLY"
+        if s["rx_bytes"] is not None:
+            rxtx = f"rx={s['rx_bytes'] / 1_000_000:.2f}MB tx={s['tx_bytes'] / 1_000_000:.2f}MB"
+        else:
+            rxtx = "rx/tx n/a"
+        print(f"{s['name']:<20} {s['mode']:<12} iface={s['iface'] or '-':<10} "
+              f"state={s['state']:<9} peer={s['peer_ip'] or '-':<14} "
+              f"ping={ping_s:<10} {rxtx}")
 
 
 def _teardown_tunnel(row):
@@ -1256,7 +1343,10 @@ def cmd_tunnel_speedtest_client(args):
 # link alone does not establish every supported proxy protocol." This
 # script parses the share link, writes a standard Xray JSON config (local
 # SOCKS5 + HTTP inbound -> the parsed outbound), and starts/stops the
-# user's own `xray` binary. It does not reimplement any proxy protocol.
+# user's own `xray` binary. It does not reimplement any proxy protocol,
+# and it never downloads or installs xray itself — if you already run your
+# own panel/stack on top of xray, this whole `proxy` subcommand is entirely
+# optional and can be ignored.
 # --------------------------------------------------------------------------
 
 import base64 as _b64
@@ -1485,7 +1575,8 @@ def cmd_proxy_import(args):
 def cmd_proxy_start(args):
     if not which("xray"):
         die("the `xray` binary is required and must be installed separately "
-            "(this only generates its config and runs it — same as the original project)")
+            "(this only generates its config and runs it — same as the original project; "
+            "this script never installs xray itself)")
     conn = db()
     row = conn.execute("SELECT * FROM proxies WHERE name=?", (args.name,)).fetchone()
     if not row:
@@ -1550,7 +1641,7 @@ def cmd_proxy_test(args):
 
 
 # --------------------------------------------------------------------------
-# Network controls (iptables / tc)
+# Network controls (iptables / tc / haproxy)
 # --------------------------------------------------------------------------
 
 def _ipt(family):
@@ -1628,6 +1719,76 @@ def cmd_net_forward_apply(args):
     _save_rule(args.name, "forward", cfg, applied=True)
     print(f"applied port-forward '{args.name}': {cfg['listen_port']} -> "
           f"{cfg['dest_addr']}:{cfg['dest_port']}")
+
+
+# ---- haproxy-based TCP forwarding (alternative to iptables DNAT) --------
+#
+# haproxy only speaks TCP (no UDP passthrough), so this method is offered
+# for TCP ports only; UDP ports always fall back to the iptables method
+# above, automatically, from do_port_forward_flow().
+
+HAPROXY_CFG_PATH = Path("/etc/haproxy/haproxy.cfg")
+
+
+def _haproxy_block_markers(name):
+    return (f"# >>> imonitor-cli managed block: {name} >>>",
+            f"# <<< imonitor-cli managed block: {name} <<<")
+
+
+def cmd_net_forward_apply_haproxy(name, listen_port, dest_addr, dest_port):
+    """Append a simple TCP frontend/backend pair to haproxy.cfg for one
+    forwarded port, then reload haproxy. Idempotent: re-running with the
+    same name is a no-op if the block is already present."""
+    if not which("haproxy"):
+        die("haproxy is not installed — install it, or use the iptables method instead")
+    if not HAPROXY_CFG_PATH.exists():
+        die(f"{HAPROXY_CFG_PATH} not found — install/initialize haproxy first, "
+            f"or use the iptables forwarding method instead")
+    begin, end = _haproxy_block_markers(name)
+    block = (
+        f"\n{begin}\n"
+        f"frontend imon_{name}_front\n"
+        f"    bind :::{listen_port} v4v6\n"
+        f"    mode tcp\n"
+        f"    default_backend imon_{name}_back\n"
+        f"backend imon_{name}_back\n"
+        f"    mode tcp\n"
+        f"    server imon_{name}_srv {dest_addr}:{dest_port}\n"
+        f"{end}\n"
+    )
+    if DRY_RUN:
+        print(f"[dry-run] would append to {HAPROXY_CFG_PATH}:\n{block}")
+        print("[dry-run] systemctl reload haproxy")
+    else:
+        text = HAPROXY_CFG_PATH.read_text()
+        if begin in text:
+            print(f"haproxy block for '{name}' already present, leaving as-is")
+        else:
+            with open(HAPROXY_CFG_PATH, "a") as f:
+                f.write(block)
+            run(["systemctl", "reload", "haproxy"], check=False)
+    print(f"applied haproxy TCP forward '{name}': *:{listen_port} -> {dest_addr}:{dest_port}")
+    _save_rule(name, "forward",
+               {"proto": "tcp", "listen_port": listen_port, "dest_addr": dest_addr,
+                "dest_port": dest_port, "method": "haproxy", "family": 4},
+               applied=True)
+
+
+def _teardown_haproxy_rule(name):
+    begin, end = _haproxy_block_markers(name)
+    if not HAPROXY_CFG_PATH.exists():
+        return
+    text = HAPROXY_CFG_PATH.read_text()
+    if begin not in text or end not in text:
+        return
+    pre, rest = text.split(begin, 1)
+    _, post = rest.split(end, 1)
+    new_text = pre.rstrip("\n") + "\n" + post.lstrip("\n")
+    if not DRY_RUN:
+        HAPROXY_CFG_PATH.write_text(new_text)
+        run(["systemctl", "reload", "haproxy"], check=False)
+    else:
+        print(f"[dry-run] would remove haproxy block '{name}' and reload haproxy")
 
 
 def cmd_net_shape_add(args):
@@ -1728,20 +1889,23 @@ def _teardown_net_rule(row):
         cmd += ["-j", "SNAT", "--to-source", cfg["source"]]
         run(cmd, check=False)
     elif kind == "forward":
-        ipt = _ipt(cfg["family"])
-        dnat_cmd = [ipt, "-t", "nat", "-D", "PREROUTING"]
-        if cfg.get("iface"):
-            dnat_cmd += ["-i", cfg["iface"]]
-        dnat_cmd += ["-p", cfg["proto"], "--dport", str(cfg["listen_port"]),
-                     "-j", "DNAT", "--to-destination", f"{cfg['dest_addr']}:{cfg['dest_port']}"]
-        run(dnat_cmd, check=False)
-        fwd_cmd = [ipt, "-D", "FORWARD", "-p", cfg["proto"], "-d", cfg["dest_addr"],
-                   "--dport", str(cfg["dest_port"]), "-j", "ACCEPT"]
-        run(fwd_cmd, check=False)
-        if cfg.get("masquerade"):
-            run([ipt, "-t", "nat", "-D", "POSTROUTING", "-p", cfg["proto"],
-                 "-d", cfg["dest_addr"], "--dport", str(cfg["dest_port"]), "-j", "MASQUERADE"],
-                check=False)
+        if cfg.get("method") == "haproxy":
+            _teardown_haproxy_rule(row["name"])
+        else:
+            ipt = _ipt(cfg["family"])
+            dnat_cmd = [ipt, "-t", "nat", "-D", "PREROUTING"]
+            if cfg.get("iface"):
+                dnat_cmd += ["-i", cfg["iface"]]
+            dnat_cmd += ["-p", cfg["proto"], "--dport", str(cfg["listen_port"]),
+                         "-j", "DNAT", "--to-destination", f"{cfg['dest_addr']}:{cfg['dest_port']}"]
+            run(dnat_cmd, check=False)
+            fwd_cmd = [ipt, "-D", "FORWARD", "-p", cfg["proto"], "-d", cfg["dest_addr"],
+                       "--dport", str(cfg["dest_port"]), "-j", "ACCEPT"]
+            run(fwd_cmd, check=False)
+            if cfg.get("masquerade"):
+                run([ipt, "-t", "nat", "-D", "POSTROUTING", "-p", cfg["proto"],
+                     "-d", cfg["dest_addr"], "--dport", str(cfg["dest_port"]), "-j", "MASQUERADE"],
+                    check=False)
     elif kind == "shape":
         run(["tc", "qdisc", "del", "dev", cfg["iface"], "root"], check=False)
     elif kind == "tcplimit":
@@ -1766,7 +1930,7 @@ def cmd_net_delete(args):
     conn = db()
     conn.execute("DELETE FROM net_rules WHERE id=?", (row["id"],))
     conn.commit()
-    print(f"removed rule '{args.name}'" + (" and its underlying iptables/tc rule" if row["applied"] else ""))
+    print(f"removed rule '{args.name}'" + (" and its underlying iptables/tc/haproxy rule" if row["applied"] else ""))
 
 
 # --------------------------------------------------------------------------
@@ -2002,6 +2166,8 @@ def build_parser():
         if inner:
             sp.add_argument("--inner-local", help="e.g. 10.20.0.1/30")
             sp.add_argument("--inner-peer", help="e.g. 10.20.0.2")
+        sp.add_argument("--mtu", type=int, default=DEFAULT_MTU,
+                         help=f"dedicated tunnel MTU (default {DEFAULT_MTU})")
 
     sp = createsub.add_parser("gre"); common(sp)
     sp.add_argument("--ttl", type=int); sp.add_argument("--tos", type=int); sp.add_argument("--key")
@@ -2020,16 +2186,16 @@ def build_parser():
     sp.set_defaults(func=cmd_tunnel_create)
 
     sp = createsub.add_parser("vxlan"); common(sp)
-    sp.add_argument("--vni", type=int, default=42); sp.add_argument("--port", type=int, default=4789)
+    sp.add_argument("--vni", type=int, default=42); sp.add_argument("--port", type=int, default=DEFAULT_TUNNEL_PORT)
     sp.add_argument("--dev", help="physical egress device")
     sp.set_defaults(func=cmd_tunnel_create)
 
     sp = createsub.add_parser("geneve"); common(sp)
-    sp.add_argument("--vni", type=int, default=42); sp.add_argument("--port", type=int)
+    sp.add_argument("--vni", type=int, default=42); sp.add_argument("--port", type=int, default=DEFAULT_TUNNEL_PORT)
     sp.set_defaults(func=cmd_tunnel_create)
 
     sp = createsub.add_parser("gue"); common(sp)
-    sp.add_argument("--port", type=int, default=5555)
+    sp.add_argument("--port", type=int, default=DEFAULT_TUNNEL_PORT)
     sp.add_argument("--ttl", type=int); sp.add_argument("--tos", type=int)
     sp.set_defaults(func=cmd_tunnel_create)
 
@@ -2037,8 +2203,8 @@ def build_parser():
     sp.add_argument("--privkey-file", required=True, help="path to file containing this host's WG private key")
     sp.add_argument("--peer-pubkey", required=True)
     sp.add_argument("--psk-file")
-    sp.add_argument("--listen-port", type=int, default=51820)
-    sp.add_argument("--remote-port", type=int, default=51820)
+    sp.add_argument("--listen-port", type=int, default=DEFAULT_TUNNEL_PORT)
+    sp.add_argument("--remote-port", type=int, default=DEFAULT_TUNNEL_PORT)
     sp.add_argument("--allowed-ips")
     sp.set_defaults(func=cmd_tunnel_create)
 
@@ -2048,8 +2214,8 @@ def build_parser():
     sp.add_argument("--peer-tunnel-id", type=int, required=True)
     sp.add_argument("--session-id", type=int, required=True)
     sp.add_argument("--peer-session-id", type=int, required=True)
-    sp.add_argument("--local-port", type=int, default=1701)
-    sp.add_argument("--remote-port", type=int, default=1701)
+    sp.add_argument("--local-port", type=int, default=DEFAULT_TUNNEL_PORT)
+    sp.add_argument("--remote-port", type=int, default=DEFAULT_TUNNEL_PORT)
     sp.set_defaults(func=cmd_tunnel_create)
 
     sp = createsub.add_parser("esp"); common(sp)
@@ -2059,13 +2225,13 @@ def build_parser():
     sp.set_defaults(func=cmd_tunnel_create)
 
     sp = createsub.add_parser("tun-udp"); common(sp)
-    sp.add_argument("--local-port", type=int, required=True)
-    sp.add_argument("--remote-port", type=int, required=True)
+    sp.add_argument("--local-port", type=int, default=DEFAULT_TUNNEL_PORT)
+    sp.add_argument("--remote-port", type=int, default=DEFAULT_TUNNEL_PORT)
     sp.set_defaults(func=cmd_tunnel_create)
 
     sp = createsub.add_parser("tun-tcp"); common(sp)
-    sp.add_argument("--local-port", type=int)
-    sp.add_argument("--remote-port", type=int)
+    sp.add_argument("--local-port", type=int, default=DEFAULT_TUNNEL_PORT)
+    sp.add_argument("--remote-port", type=int, default=DEFAULT_TUNNEL_PORT)
     sp.add_argument("--listen", action="store_true", help="listen instead of connecting out")
     sp.set_defaults(func=cmd_tunnel_create)
 
@@ -2089,6 +2255,7 @@ def build_parser():
     sp.add_argument("--peer-tun-num", type=int, required=True)
     sp.add_argument("--inner-local")
     sp.add_argument("--inner-peer")
+    sp.add_argument("--mtu", type=int, default=DEFAULT_MTU)
     sp.set_defaults(func=cmd_tunnel_create)
 
     sp = createsub.add_parser("reverse-ssh")
@@ -2103,6 +2270,7 @@ def build_parser():
     sp.set_defaults(func=cmd_tunnel_create)
 
     a = tunsub.add_parser("list"); a.set_defaults(func=cmd_tunnel_list)
+    a = tunsub.add_parser("status"); a.set_defaults(func=cmd_tunnel_status)
     a = tunsub.add_parser("delete"); a.add_argument("--name", required=True)
     a.set_defaults(func=cmd_tunnel_delete)
     a = tunsub.add_parser("ping"); a.add_argument("--name", required=True)
@@ -2125,7 +2293,8 @@ def build_parser():
     a.set_defaults(func=cmd_tunnel_speedtest_client)
 
     # ---------------- proxy (VMess/VLESS/Trojan/Shadowsocks via Xray) ----------------
-    prx = sub.add_parser("proxy", help="VMess/VLESS/Trojan/Shadowsocks entries (needs the xray binary)")
+    prx = sub.add_parser("proxy", help="VMess/VLESS/Trojan/Shadowsocks entries (needs the xray binary; "
+                                        "entirely optional, nothing here installs xray)")
     prxsub = prx.add_subparsers(dest="subcommand", required=True)
 
     a = prxsub.add_parser("import")
@@ -2171,6 +2340,13 @@ def build_parser():
     a.set_defaults(func=cmd_net_forward_add)
     a = fwdsub.add_parser("apply"); a.add_argument("--name", required=True)
     a.set_defaults(func=cmd_net_forward_apply)
+    a = fwdsub.add_parser("apply-haproxy", help="forward one TCP port via haproxy instead of iptables")
+    a.add_argument("--name", required=True)
+    a.add_argument("--listen-port", type=int, required=True)
+    a.add_argument("--dest-addr", required=True)
+    a.add_argument("--dest-port", type=int, required=True)
+    a.set_defaults(func=lambda args: cmd_net_forward_apply_haproxy(
+        args.name, args.listen_port, args.dest_addr, args.dest_port))
 
     shp = netsub.add_parser("shape"); shpsub = shp.add_subparsers(dest="action", required=True)
     a = shpsub.add_parser("add")
@@ -2247,11 +2423,13 @@ def build_parser():
 
 # ==========================================================================
 # Interactive menu — Iran <-> Kharej role-based install, one protocol at a
-# time, with automatic post-tunnel port forwarding and a full "remove
-# everything" option. This is what runs when you launch the script with no
-# arguments; every CLI subcommand above still works unchanged for scripting.
-# Default inner addressing convention used throughout: Iran (server) =
-# 10.10.10.2, Kharej (client) = 10.10.10.1 -- override any prompt if needed.
+# time, with automatic outer-IP auto-detection, a shared dedicated MTU,
+# automatic post-tunnel port forwarding (iptables or haproxy), and a full
+# "remove everything" / "status" option. This is what runs when you launch
+# the script with no arguments; every CLI subcommand above still works
+# unchanged for scripting. Default inner addressing convention used
+# throughout: Iran (server) = 10.10.10.2, Kharej (client) = 10.10.10.1 --
+# override any prompt if needed.
 # ==========================================================================
 
 def prompt(msg, default=None, required=False):
@@ -2308,6 +2486,7 @@ def prompt_menu(title, options):
 
 
 def detect_public_ip():
+    """Auto-detect this host's own outer IPv4 address."""
     try:
         r = subprocess.run(["curl", "-4", "-s", "--max-time", "3", "https://ifconfig.me"],
                             capture_output=True, text=True, timeout=5)
@@ -2317,6 +2496,30 @@ def detect_public_ip():
     except Exception:
         pass
     return None
+
+
+def detect_public_ipv6():
+    """Auto-detect this host's own outer IPv6 address."""
+    try:
+        r = subprocess.run(["curl", "-6", "-s", "--max-time", "3", "https://ifconfig.me"],
+                            capture_output=True, text=True, timeout=5)
+        ip = r.stdout.strip()
+        if ":" in ip and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            return ip
+    except Exception:
+        pass
+    return None
+
+
+def detect_public_ip_auto():
+    """Try IPv4 first, then IPv6. Returns (ip_or_None, family)."""
+    ip = detect_public_ip()
+    if ip:
+        return ip, 4
+    ip6 = detect_public_ipv6()
+    if ip6:
+        return ip6, 6
+    return None, 4
 
 
 def prompt_role():
@@ -2331,32 +2534,55 @@ def prompt_role():
 
 
 def prompt_common(is_server, default_name):
+    """Collect this tunnel's parameters. The LOCAL outer address is always
+    auto-detected (IPv4, falling back to IPv6) and is never asked — only the
+    PEER's outer address (v4 or v6) is prompted for, per the Iran/Kharej
+    addressing convention."""
     name = prompt("Name of this tunnel", default=default_name)
-    local = prompt("Outer/Public address of this server", default=detect_public_ip(), required=True)
-    remote = prompt("Outer/Public address of the peer server", required=True)
+    local, local_fam = detect_public_ip_auto()
+    if local:
+        print(f"This server's own outer address was auto-detected: {local} (IPv{local_fam})")
+    else:
+        print("Could not auto-detect this server's outer address.")
+        local = prompt("Enter this server's own outer address (IPv4 or IPv6)", required=True)
+    peer_role = "Kharej/foreign client" if is_server else "Iran server"
+    remote = prompt(f"Outer address (IPv4 or IPv6) of the peer {peer_role}", required=True)
     inner_local = prompt("Inner address of this server",
                           default="10.10.10.2/30" if is_server else "10.10.10.1/30")
     inner_peer_full = prompt("Inner address of the peer server",
                               default="10.10.10.1" if is_server else "10.10.10.2")
     inner_peer_ip = inner_peer_full.split("/")[0]
-    return name, local, remote, inner_local, inner_peer_ip
+    mtu = prompt_int("Dedicated tunnel MTU", default=DEFAULT_MTU)
+    return name, local, remote, inner_local, inner_peer_ip, mtu
 
 
 def do_port_forward_flow(inner_peer_ip, family=4):
     print("\n--- Port forwarding through this tunnel ---")
     ports_raw = prompt("Enter the ports that should go through this tunnel, comma-separated "
-                        "(e.g. 443,8080,2053) — leave blank to skip", default="")
+                        "(e.g. 1080,443) — leave blank to skip", default="")
     if not ports_raw.strip():
         print("No forwarding rule was added.")
         return
     proto_choice = prompt("Which protocol should be forwarded? (tcp/udp/both)", default="both").lower()
     protos = ["tcp", "udp"] if proto_choice not in ("tcp", "udp") else [proto_choice]
+    method = prompt("Forward automatically using iptables or haproxy? (iptables/haproxy)",
+                     default="iptables").lower()
+    if method not in ("iptables", "haproxy"):
+        method = "iptables"
+    if method == "haproxy" and "udp" in protos:
+        print("note: haproxy only forwards TCP — UDP ports below will still use iptables automatically.")
     for p in [x.strip() for x in ports_raw.split(",") if x.strip()]:
         if not p.isdigit():
             print(f"  skipped (not a number): {p}")
             continue
         for proto in protos:
-            rule_name = f"fwd-{inner_peer_ip.replace('.', '-')}-{p}-{proto}"
+            rule_name = f"fwd-{inner_peer_ip.replace('.', '-').replace(':', '-')}-{p}-{proto}"
+            if method == "haproxy" and proto == "tcp":
+                try:
+                    cmd_net_forward_apply_haproxy(rule_name, int(p), inner_peer_ip, int(p))
+                    continue
+                except SystemExit:
+                    print(f"  haproxy forward failed for port {p}/{proto}, falling back to iptables")
             a_add = SimpleNamespace(name=rule_name, proto=proto, listen_port=int(p),
                                      dest_addr=inner_peer_ip, dest_port=int(p),
                                      iface=None, masquerade=True, family=family)
@@ -2400,8 +2626,9 @@ def after_create(name, inner_peer_ip, iface, is_server, family=4,
     else:
         print("  \u26a0 Ping failed. Make sure the peer server has installed the same tunnel with matching "
               "settings (IDs/keys/VNI/port must match exactly).")
-    if is_server:
-        do_port_forward_flow(inner_peer_ip, family=family)
+    # Port forwarding is always offered at the end of every tunnel install,
+    # on either role — leave the port list blank to skip it.
+    do_port_forward_flow(inner_peer_ip, family=family)
 
 
 # ---- one menu function per protocol -------------------------------------
@@ -2409,11 +2636,11 @@ def after_create(name, inner_peer_ip, iface, is_server, family=4,
 def menu_gre():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "gre0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "gre0")
     key = prompt("GRE key (shared and identical on both servers, optional)", default="")
     ttl = prompt_int("TTL", default=64)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
-                         inner_peer=inner_peer_ip, key=key or None, ttl=ttl, tos=None)
+                         inner_peer=inner_peer_ip, key=key or None, ttl=ttl, tos=None, mtu=mtu)
     tunnel_create_gre(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2421,10 +2648,10 @@ def menu_gre():
 def menu_gretap():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "gretap0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "gretap0")
     key = prompt("GRE key (shared and identical on both servers, optional)", default="")
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
-                         inner_peer=inner_peer_ip, key=key or None)
+                         inner_peer=inner_peer_ip, key=key or None, mtu=mtu)
     tunnel_create_gretap(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2432,10 +2659,10 @@ def menu_gretap():
 def menu_ipip():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "ipip0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "ipip0")
     ttl = prompt_int("TTL", default=64)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
-                         inner_peer=inner_peer_ip, ttl=ttl, tos=None)
+                         inner_peer=inner_peer_ip, ttl=ttl, tos=None, mtu=mtu)
     tunnel_create_ipip(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2443,10 +2670,10 @@ def menu_ipip():
 def menu_sit():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "sit0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "sit0")
     ttl = prompt_int("TTL", default=64)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
-                         inner_peer=inner_peer_ip, ttl=ttl)
+                         inner_peer=inner_peer_ip, ttl=ttl, mtu=mtu)
     tunnel_create_sit(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2454,11 +2681,11 @@ def menu_sit():
 def menu_vxlan():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "vxlan0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "vxlan0")
     vni = prompt_int("VNI (must be the same on both servers)", default=42)
-    port = prompt_int("VXLAN port", default=4789)
+    port = prompt_int("VXLAN port (shared Iran<->Kharej tunnel port)", default=DEFAULT_TUNNEL_PORT)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
-                         inner_peer=inner_peer_ip, vni=vni, port=port, dev=None)
+                         inner_peer=inner_peer_ip, vni=vni, port=port, dev=None, mtu=mtu)
     tunnel_create_vxlan(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2466,11 +2693,11 @@ def menu_vxlan():
 def menu_geneve():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "gnv0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "gnv0")
     vni = prompt_int("VNI (must be the same on both servers)", default=42)
-    port = prompt_int("GENEVE port", default=6081)
+    port = prompt_int("GENEVE port (shared Iran<->Kharej tunnel port)", default=DEFAULT_TUNNEL_PORT)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
-                         inner_peer=inner_peer_ip, vni=vni, port=port)
+                         inner_peer=inner_peer_ip, vni=vni, port=port, mtu=mtu)
     tunnel_create_geneve(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2478,11 +2705,11 @@ def menu_geneve():
 def menu_gue():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "gue0")
-    port = prompt_int("GUE port (Gaming profile)", default=5555)
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "gue0")
+    port = prompt_int("GUE port (Gaming profile, shared Iran<->Kharej tunnel port)", default=DEFAULT_TUNNEL_PORT)
     ttl = prompt_int("TTL", default=64)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
-                         inner_peer=inner_peer_ip, port=port, ttl=ttl, tos=0)
+                         inner_peer=inner_peer_ip, port=port, ttl=ttl, tos=0, mtu=mtu)
     tunnel_create_gue(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2490,8 +2717,8 @@ def menu_gue():
 def menu_wireguard():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "wg0")
-    port = prompt_int("WireGuard port", default=51820)
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "wg0")
+    port = prompt_int("WireGuard port (shared Iran<->Kharej tunnel port)", default=DEFAULT_TUNNEL_PORT)
     ensure_home()
     priv_path = HOME_DIR / f"{name}-private.key"
     pub_path = HOME_DIR / f"{name}-public.key"
@@ -2501,7 +2728,7 @@ def menu_wireguard():
     local_pub = pub_path.read_text().strip() if pub_path.exists() else "(dry-run: unknown)"
     print(f"\nPublic key of this server — enter this on the peer server:\n  {local_pub}\n")
     peer_pub = prompt("Paste the peer server's public key here", required=True)
-    psk = prompt("Shared PSK (optional, must be the same on both servers)", default="")
+    psk = prompt("Shared PSK (must be identical on both servers)", default=DEFAULT_PSK)
     psk_path = None
     if psk:
         psk_path = HOME_DIR / f"{name}-psk.key"
@@ -2509,7 +2736,7 @@ def menu_wireguard():
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, privkey_file=str(priv_path),
                          peer_pubkey=peer_pub, psk_file=str(psk_path) if psk_path else None,
-                         listen_port=port, remote_port=port, allowed_ips=None)
+                         listen_port=port, remote_port=port, allowed_ips=None, mtu=mtu)
     tunnel_create_wireguard(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2517,19 +2744,22 @@ def menu_wireguard():
 def menu_l2tpv3():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "l2tp0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "l2tp0")
     encap = prompt("Encapsulation type (udp/ip)", default="udp")
     conn_id = prompt_int("Connection ID number (enter this exact number on the peer server too)", default=100)
     if is_server:
         tunnel_id, peer_tunnel_id, session_id, peer_session_id = conn_id, conn_id + 1, conn_id, conn_id + 1
     else:
         tunnel_id, peer_tunnel_id, session_id, peer_session_id = conn_id + 1, conn_id, conn_id + 1, conn_id
-    local_port = prompt_int("Local UDP port", default=1701) if encap == "udp" else 1701
-    remote_port = prompt_int("Peer UDP port", default=1701) if encap == "udp" else 1701
+    local_port = prompt_int("Local UDP port (shared Iran<->Kharej tunnel port)",
+                             default=DEFAULT_TUNNEL_PORT) if encap == "udp" else DEFAULT_TUNNEL_PORT
+    remote_port = prompt_int("Peer UDP port (shared Iran<->Kharej tunnel port)",
+                              default=DEFAULT_TUNNEL_PORT) if encap == "udp" else DEFAULT_TUNNEL_PORT
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip, encap=encap, tunnel_id=tunnel_id,
                          peer_tunnel_id=peer_tunnel_id, session_id=session_id,
-                         peer_session_id=peer_session_id, local_port=local_port, remote_port=remote_port)
+                         peer_session_id=peer_session_id, local_port=local_port, remote_port=remote_port,
+                         mtu=mtu)
     tunnel_create_l2tpv3(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2537,12 +2767,12 @@ def menu_l2tpv3():
 def menu_esp():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "esp0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "esp0")
     if is_server:
         print("\nKeys will be generated automatically and shown at the end to copy to the peer server.")
         a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                              inner_peer=inner_peer_ip, local_net=None, remote_net=None,
-                             spi_out=None, spi_in=None, enc_key=None, auth_key=None)
+                             spi_out=None, spi_in=None, enc_key=None, auth_key=None, mtu=mtu)
     else:
         print("\nEnter the values shown by the Iran server here "
               "(the SPIs are already swapped, as shown by the server).")
@@ -2552,7 +2782,7 @@ def menu_esp():
         spi_in = prompt_int("spi_in", required=True)
         a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                              inner_peer=inner_peer_ip, local_net=None, remote_net=None,
-                             spi_out=spi_out, spi_in=spi_in, enc_key=enc_key, auth_key=auth_key)
+                             spi_out=spi_out, spi_in=spi_in, enc_key=enc_key, auth_key=auth_key, mtu=mtu)
     tunnel_create_esp(a)
     after_create(name, inner_peer_ip, None, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2560,11 +2790,11 @@ def menu_esp():
 def menu_tun_udp():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "tun-udp0")
-    local_port = prompt_int("Local port (suggested range 56000-56899)", default=56000)
-    remote_port = prompt_int("Peer port (suggested range 55000-55899)", default=55000)
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "tun-udp0")
+    local_port = prompt_int("Local port (shared Iran<->Kharej tunnel port)", default=DEFAULT_TUNNEL_PORT)
+    remote_port = prompt_int("Peer port (shared Iran<->Kharej tunnel port)", default=DEFAULT_TUNNEL_PORT)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
-                         inner_peer=inner_peer_ip, local_port=local_port, remote_port=remote_port)
+                         inner_peer=inner_peer_ip, local_port=local_port, remote_port=remote_port, mtu=mtu)
     tunnel_create_tun_udp(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2572,14 +2802,14 @@ def menu_tun_udp():
 def menu_tun_tcp():
     is_server = prompt_role()
     if is_server is None: return
-    name, local, remote, inner_local, inner_peer_ip = prompt_common(is_server, "tun-tcp0")
+    name, local, remote, inner_local, inner_peer_ip, mtu = prompt_common(is_server, "tun-tcp0")
     listen = prompt_yesno("Should this server listen (wait for a connection from the peer)?", default=is_server)
-    port = prompt_int("TCP port (suggested range 55000-55899)", default=55000)
+    port = prompt_int("TCP port (shared Iran<->Kharej tunnel port)", default=DEFAULT_TUNNEL_PORT)
     a = SimpleNamespace(name=name, local=local, remote=remote, inner_local=inner_local,
                          inner_peer=inner_peer_ip,
                          local_port=port if listen else None,
                          remote_port=None if listen else port,
-                         listen=listen)
+                         listen=listen, mtu=mtu)
     tunnel_create_tun_tcp(a)
     after_create(name, inner_peer_ip, name, is_server, local=local, remote=remote, inner_local=inner_local)
 
@@ -2617,10 +2847,11 @@ def menu_ssh():
         peer_tun_num = prompt_int("Peer tun number", default=10)
         inner_local = prompt("Inner address of this server", default="10.10.10.2/30")
         inner_peer = prompt("Inner address of the peer server", default="10.10.10.1")
+        mtu = prompt_int("Dedicated tunnel MTU", default=DEFAULT_MTU)
         a = SimpleNamespace(name=name, remote=remote, user=user, port=port,
                              identity=identity or None, password=password or None,
                              local_tun_num=local_tun_num, peer_tun_num=peer_tun_num,
-                             inner_local=inner_local, inner_peer=inner_peer)
+                             inner_local=inner_local, inner_peer=inner_peer, mtu=mtu)
         tunnel_create_ssh(a)
         after_create(name, inner_peer.split("/")[0], f"tun{local_tun_num}", True,
                      local=local, remote=remote, inner_local=inner_local)
@@ -2646,6 +2877,11 @@ def menu_list_tunnels():
     input("\nPress Enter to return...")
 
 
+def menu_status():
+    cmd_tunnel_status(SimpleNamespace())
+    input("\nPress Enter to return...")
+
+
 def menu_list_net_rules():
     cmd_net_list(SimpleNamespace())
     input("\nPress Enter to return...")
@@ -2653,7 +2889,7 @@ def menu_list_net_rules():
 
 def menu_remove_all():
     print("\n\u26a0  This option will completely remove all tunnels, network rules")
-    print("    (SNAT/Forward/Shaping/TCP-limit/Watch) and proxy entries managed by this script.")
+    print("    (SNAT/Forward/Shaping/TCP-limit/Watch, iptables AND haproxy) and proxy entries managed by this script.")
     if not prompt_yesno("Continue?", default=False):
         print("Cancelled.")
         return
@@ -2695,6 +2931,7 @@ MENU_ACTIONS = {
     "9": menu_l2tpv3, "10": menu_esp, "11": menu_tun_udp, "12": menu_tun_tcp,
     "13": menu_tun_icmp, "14": menu_ssh, "15": menu_etherip,
     "16": menu_list_tunnels, "17": menu_list_net_rules, "18": menu_remove_all,
+    "19": menu_status,
 }
 
 
@@ -2719,6 +2956,7 @@ def main_menu():
             ("16", "Show list of active tunnels"),
             ("17", "Show network rules (SNAT/Forward/Shape/...)"),
             ("18", "\u2716  Remove ALL applied changes (Remove ALL)"),
+            ("19", "\U0001f4ca Show tunnel status (ping + traffic, per tunnel)"),
             ("0", "Exit"),
         ])
         if choice == "0":
